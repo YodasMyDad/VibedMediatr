@@ -1,0 +1,28 @@
+﻿@page
+@model VibedMediatr.Example.Pages.IndexModel
+@{
+    ViewData["Title"] = "VibedMediatr Example";
+}
+
+<div class="text-center">
+    <h1 class="display-4">VibedMediatr Demo</h1>
+    <p class="lead">A minimal, efficient MediatR replacement</p>
+
+    @if (Model.Reply != null)
+    {
+        <div class="alert alert-success mt-4">
+            <h4>Mediator Response:</h4>
+            <p class="mb-0">@Model.Reply</p>
+        </div>
+    }
+
+    <div class="mt-4">
+        <p>This page demonstrates VibedMediatr in action:</p>
+        <ul class="list-unstyled">
+            <li>✅ Minimal surface area - only <code>IRequest</code> and <code>IRequestHandler</code> contracts</li>
+            <li>✅ Drop-in replacement for MediatR</li>
+            <li>✅ Assembly scanning with caching for performance</li>
+            <li>✅ Scoped mediator to avoid service provider capture</li>
+        </ul>
+    </div>
+</div>

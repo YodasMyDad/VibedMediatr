@@ -1,0 +1,422 @@
+---
+alwaysApply: true
+---
+
+# VibedMediatr – Product Design Requirements (PDR)
+
+> **Goal:** Provide a tiny, secure, efficient, drop‑in replacement for the most common MediatR usage pattern (request/handler + Send) while keeping code and concepts minimal. The only public contracts we promise to support are **`IRequest`** and **`IRequestHandler`** (generic and non‑generic). Everything else is intentionally out of scope.
+
+Use existing projects for initial code and add tests project.
+
+---
+
+## 1) Scope & Non‑Goals
+
+### In‑Scope
+
+* `IRequest<TResponse>` and `IRequest` interfaces (names and signatures compatible with MediatR).
+* `IRequestHandler<TRequest, TResponse>` and `IRequestHandler<TRequest>` interfaces (names and signatures compatible with MediatR).
+* A minimal `IMediator` with `Send(...)` overloads to dispatch a request to its single handler.
+* Dependency injection registration via `IServiceCollection` with an overload to add **additional assemblies** to scan for handlers.
+* Assembly scanning with **caching** to avoid repeated reflection costs.
+* Secure-by-default scanning (only assemblies explicitly chosen) with graceful failure behavior.
+* Test project covering core behavior.
+* Minimal Razor Pages sample demonstrating usage.
+
+### Non‑Goals / Out of Scope
+
+* Notifications, behaviors/pipelines, stream handlers, pre/post-processors, request pre/post behaviors, publishing to multiple handlers.
+* Source generators, compile-time registration, or third-party scanning packages.
+* Advanced lifetime management beyond what default DI provides.
+* Backward compatibility beyond the specified interfaces.
+
+---
+
+## 2) Target Platforms & Tooling
+
+* **TFM:** `net9.0`
+* **Language:** C# 13 (as shipped with .NET 9)
+* **DI Container:** `Microsoft.Extensions.DependencyInjection`
+* **Logging (optional):** `Microsoft.Extensions.Logging`
+* **Tests:** xUnit + FluentAssertions (or only xUnit for minimalism)
+* **Packaging:** NuGet package id **`VibedMediatr`**, license MIT
+
+---
+
+## 3) Public API (Minimal Surface)
+
+> To be as drop‑in as possible, **the public contracts live in the `MediatR` namespace**. This means consumers with `using MediatR;` typically do not need to change code. Implementation types live in `VibedMediatr`.
+
+```csharp
+// Assembly: VibedMediatr
+// Namespace preserved for drop-in compatibility
+namespace MediatR
+{
+    public interface IRequest<out TResponse> { }
+    public interface IRequest { }
+
+    public interface IRequestHandler<in TRequest, TResponse>
+        where TRequest : IRequest<TResponse>
+    {
+        Task<TResponse> Handle(TRequest request, CancellationToken cancellationToken);
+    }
+
+    public interface IRequestHandler<in TRequest>
+        where TRequest : IRequest
+    {
+        Task Handle(TRequest request, CancellationToken cancellationToken);
+    }
+
+    // Minimal mediator to make Send(...) available in consumer code.
+    public interface IMediator
+    {
+        Task<TResponse> Send<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default);
+        Task Send(IRequest request, CancellationToken cancellationToken = default);
+    }
+}
+```
+
+### DI Registration
+
+```csharp
+namespace VibedMediatr;
+
+public static class ServiceCollectionExtensions
+{
+    // Default: scan the entry assembly only
+    public static IServiceCollection AddVibedMediatr(this IServiceCollection services)
+        => AddVibedMediatr(services, Array.Empty<Assembly>());
+
+    // Overload: allow callers to pass additional assemblies to scan
+    public static IServiceCollection AddVibedMediatr(this IServiceCollection services, params Assembly[] additionalAssemblies)
+    {
+        var assemblies = new HashSet<Assembly>();
+        var entry = Assembly.GetEntryAssembly();
+        if (entry != null) assemblies.Add(entry);
+        foreach (var a in additionalAssemblies.Where(a => a != null)) assemblies.Add(a);
+
+        RegisterHandlers(services, assemblies);
+        services.AddScoped<MediatR.IMediator, Mediator>();
+        return services;
+    }
+
+    private static void RegisterHandlers(IServiceCollection services, IEnumerable<Assembly> assemblies)
+    {
+        foreach (var assembly in assemblies)
+        {
+            Type[] types;
+            try { types = assembly.GetTypes(); }
+            catch (ReflectionTypeLoadException ex) { types = ex.Types!.Where(t => t != null).ToArray()!; }
+
+            foreach (var type in types)
+            {
+                if (type is null || type.IsAbstract || type.IsInterface) continue;
+
+                foreach (var iface in type.GetInterfaces())
+                {
+                    if (!iface.IsGenericType) continue;
+                    var def = iface.GetGenericTypeDefinition();
+                    if (def == typeof(MediatR.IRequestHandler<,>) || def == typeof(MediatR.IRequestHandler<>))
+                    {
+                        services.AddTransient(iface, type);
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+### Mediator Implementation (with caching)
+
+```csharp
+using System.Collections.Concurrent;
+using MediatR;
+
+namespace VibedMediatr;
+
+internal sealed class Mediator : IMediator
+{
+    private readonly IServiceProvider _sp;
+
+    // Cache: request type -> executor delegate
+    private static readonly ConcurrentDictionary<Type, HandlerExecutor> _executorCache = new();
+
+    private delegate Task<object?> HandlerExecutor(IServiceProvider sp, object request, CancellationToken ct);
+
+    public Mediator(IServiceProvider sp) => _sp = sp;
+
+    public async Task<TResponse> Send<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
+    {
+        if (request is null) throw new ArgumentNullException(nameof(request));
+        var executor = _executorCache.GetOrAdd(request.GetType(), BuildExecutorForResponseType);
+        var result = await executor(_sp, request, cancellationToken).ConfigureAwait(false);
+        return (TResponse)result!;
+    }
+
+    public Task Send(IRequest request, CancellationToken cancellationToken = default)
+    {
+        if (request is null) throw new ArgumentNullException(nameof(request));
+        var executor = _executorCache.GetOrAdd(request.GetType(), BuildExecutorForVoidType);
+        return executor(_sp, request, cancellationToken);
+    }
+
+    private static HandlerExecutor BuildExecutorForResponseType(Type requestType)
+    {
+        var ireq = requestType.GetInterfaces().FirstOrDefault(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IRequest<>))
+                   ?? throw new InvalidOperationException($"Request type {requestType} does not implement IRequest<T>.");
+        var responseType = ireq.GetGenericArguments()[0];
+
+        var method = typeof(Mediator).GetMethod(nameof(ExecuteWithResponse), BindingFlags.NonPublic | BindingFlags.Static)!
+                                      .MakeGenericMethod(requestType, responseType);
+        return (HandlerExecutor)Delegate.CreateDelegate(typeof(HandlerExecutor), method);
+    }
+
+    private static HandlerExecutor BuildExecutorForVoidType(Type requestType)
+    {
+        if (!typeof(IRequest).IsAssignableFrom(requestType))
+            throw new InvalidOperationException($"Request type {requestType} does not implement IRequest.");
+
+        var method = typeof(Mediator).GetMethod(nameof(ExecuteVoid), BindingFlags.NonPublic | BindingFlags.Static)!
+                                      .MakeGenericMethod(requestType);
+        return (HandlerExecutor)Delegate.CreateDelegate(typeof(HandlerExecutor), method);
+    }
+
+    private static async Task<object?> ExecuteWithResponse<TRequest, TResponse>(IServiceProvider sp, object request, CancellationToken ct)
+        where TRequest : IRequest<TResponse>
+    {
+        var handler = sp.GetService(typeof(IRequestHandler<TRequest, TResponse>)) as IRequestHandler<TRequest, TResponse>
+            ?? throw new InvalidOperationException($"No handler registered for {typeof(TRequest).Name} -> {typeof(TResponse).Name}.");
+
+        var result = await handler.Handle((TRequest)request, ct).ConfigureAwait(false);
+        return result; // boxed as object
+    }
+
+    private static async Task<object?> ExecuteVoid<TRequest>(IServiceProvider sp, object request, CancellationToken ct)
+        where TRequest : IRequest
+    {
+        var handler = sp.GetService(typeof(IRequestHandler<TRequest>)) as IRequestHandler<TRequest>
+            ?? throw new InvalidOperationException($"No handler registered for {typeof(TRequest).Name}.");
+
+        await handler.Handle((TRequest)request, ct).ConfigureAwait(false);
+        return null;
+    }
+}
+```
+
+**Notes**
+
+* The cache stores a compiled delegate per **request CLR type**. First call builds the executor via reflection; subsequent calls are delegate invocations **without reflection**.
+* The mediator is **scoped** to avoid capturing the root service provider.
+* Only assemblies explicitly passed (plus entry assembly) are scanned; we do not scan everything in the app domain.
+* Multiple handlers for the same request type are undefined behavior (last registration wins under MS.DI). We document that **exactly one handler** must exist.
+
+---
+
+## 4) Security Considerations
+
+* **Assembly scanning is opt‑in**: We scan the entry assembly and any **explicitly provided** assemblies. No dynamic loading, no probing of external paths.
+* **No code generation/emit**: We avoid `ILGenerator`/`DynamicMethod`. Delegates are created via `MakeGenericMethod` once and cached.
+* **Type filtering**: Only concrete, non‑abstract classes are registered for `IRequestHandler<,>` or `IRequestHandler<>`.
+* **Dependency resolution** uses the scoped `IServiceProvider`; no static/global service locators.
+* **Graceful errors**: Clear exceptions when there’s no matching handler, or the request type doesn’t implement the expected interfaces.
+
+---
+
+## 5) Performance Considerations
+
+* **Cold path**: Minimal reflection during first request type encounter (interface inspection + `MakeGenericMethod`).
+* **Hot path**: Cached `HandlerExecutor` delegates avoid further reflection.
+* **Registration**: One-time scan of the provided assemblies; lightweight iteration over types.
+
+---
+
+## 6) Package Layout
+
+```
+VibedMediatr/
+├─ src/
+│  └─ VibedMediatr/
+│     ├─ Contracts/ (IRequest*, IMediator in MediatR namespace)
+│     ├─ Mediator.cs (implementation)
+│     ├─ ServiceCollectionExtensions.cs
+│     └─ VibedMediatr.csproj
+├─ tests/
+│  └─ VibedMediatr.Tests/
+│     ├─ PingPongTests.cs
+│     ├─ VoidRequestTests.cs
+│     ├─ AssemblyScanTests.cs
+│     └─ VibedMediatr.Tests.csproj
+└─ samples/
+   └─ RazorPagesApp/
+      ├─ Program.cs
+      ├─ Pages/
+      │  ├─ Index.cshtml
+      │  └─ Index.cshtml.cs
+      ├─ Requests/
+      │  ├─ Ping.cs
+      │  └─ PingHandler.cs
+      └─ RazorPagesApp.csproj
+```
+
+---
+
+## 7) Sample Usage (Razor Pages)
+
+**Program.cs**
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddRazorPages();
+// Scan the entry assembly + an external assembly if desired
+builder.Services.AddVibedMediatr(typeof(Program).Assembly /*, typeof(Some.External.Type).Assembly */);
+
+var app = builder.Build();
+app.MapRazorPages();
+app.Run();
+```
+
+**Requests/Ping.cs**
+
+```csharp
+using MediatR;
+
+public sealed record Ping(string Message) : IRequest<string>;
+```
+
+**Requests/PingHandler.cs**
+
+```csharp
+using MediatR;
+
+public sealed class PingHandler : IRequestHandler<Ping, string>
+{
+    public Task<string> Handle(Ping request, CancellationToken ct)
+        => Task.FromResult($"Pong: {request.Message}");
+}
+```
+
+**Pages/Index.cshtml.cs**
+
+```csharp
+using MediatR;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+
+public class IndexModel(IMediator mediator) : PageModel
+{
+    public string? Reply { get; private set; }
+
+    public async Task OnGet()
+    {
+        Reply = await mediator.Send(new Ping("hello"));
+    }
+}
+```
+
+**Pages/Index.cshtml**
+
+```html
+@page
+@model IndexModel
+<!DOCTYPE html>
+<html>
+<body>
+  <h1>@Model.Reply</h1>
+</body>
+</html>
+```
+
+---
+
+## 8) Tests (Sketch)
+
+**PingPongTests.cs**
+
+```csharp
+public sealed record Ping(string Message) : MediatR.IRequest<string>;
+public sealed class PingHandler : MediatR.IRequestHandler<Ping, string>
+{
+    public Task<string> Handle(Ping request, CancellationToken ct) => Task.FromResult($"Pong: {request.Message}");
+}
+
+public class PingPongTests
+{
+    [Fact]
+    public async Task Send_Returns_Handler_Result()
+    {
+        var services = new ServiceCollection()
+            .AddVibedMediatr(typeof(Ping).Assembly)
+            .BuildServiceProvider();
+
+        var mediator = services.CreateScope().ServiceProvider.GetRequiredService<MediatR.IMediator>();
+        var result = await mediator.Send(new Ping("x"));
+        result.Should().Be("Pong: x");
+    }
+}
+```
+
+**VoidRequestTests.cs**
+
+```csharp
+public sealed record DoThing() : MediatR.IRequest;
+public sealed class DoThingHandler : MediatR.IRequestHandler<DoThing>
+{
+    public Task Handle(DoThing request, CancellationToken ct) => Task.CompletedTask;
+}
+
+public class VoidRequestTests
+{
+    [Fact]
+    public async Task Send_VoidRequest_Completes()
+    {
+        var sp = new ServiceCollection().AddVibedMediatr(typeof(DoThing).Assembly).BuildServiceProvider();
+        var mediator = sp.CreateScope().ServiceProvider.GetRequiredService<MediatR.IMediator>();
+        await mediator.Send(new DoThing());
+    }
+}
+```
+
+**AssemblyScanTests.cs**
+
+```csharp
+[Fact]
+public async Task Additional_Assembly_Scan_Finds_Handlers()
+{
+    var sp = new ServiceCollection()
+        .AddVibedMediatr(/* entry assembly */ typeof(Program).Assembly,
+                          /* extra */ typeof(Ping).Assembly)
+        .BuildServiceProvider();
+
+    var mediator = sp.CreateScope().ServiceProvider.GetRequiredService<MediatR.IMediator>();
+    var result = await mediator.Send(new Ping("hi"));
+    result.Should().Be("Pong: hi");
+}
+```
+
+---
+
+## 9) Error Handling & Diagnostics
+
+* **No handler found** → `InvalidOperationException` with a clear message.
+* **Request without proper interface** → `InvalidOperationException` with guidance to implement `IRequest`/`IRequest<T>`.
+* Consider an optional `ILogger<Mediator>` injection for trace‑level logs (disabled by default to keep things minimal).
+
+---
+
+## 10) Versioning & License
+
+* **Version:** `0.1.0` (initial release)
+* **License:** MIT
+
+---
+
+## 11) Acceptance Criteria
+
+* ✅ Replaces MediatR for apps that only rely on `IRequest`/`IRequestHandler` and `Send(...)`.
+* ✅ Allows registration with optional extra assemblies for scanning.
+* ✅ Uses caching to minimize reflection overhead after the first call per request type.
+* ✅ Ships with a working Razor Pages sample.
+* ✅ Ships with unit tests for basic success and failure paths.
+* ✅ Minimal surface area; easy to read and maintain.
+* ✅ Contains accurate ReadMe with details and instructions

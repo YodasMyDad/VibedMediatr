@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+    <PropertyGroup>
+        <TargetFramework>net9.0</TargetFramework>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <_ContentIncludedByDefault Remove="wwwroot\_imgcache\05\72\340fdf65998e169044756af90c2644d866ae.jpg" />
+      <_ContentIncludedByDefault Remove="wwwroot\_imgcache\0a\37\e5d1af8e1192bc39252d546c68533eae6a25.jpg" />
+      <_ContentIncludedByDefault Remove="wwwroot\_imgcache\13\21\4f2a0fbf575df3cdf8f9685196abdd08da72.jpg" />
+      <_ContentIncludedByDefault Remove="wwwroot\_imgcache\64\11\aa410c5ed48781b24aa99cb8bf10e5acbf01.jpg" />
+      <_ContentIncludedByDefault Remove="wwwroot\_imgcache\92\ab\33fd9ba25e5b59bf262a1137c39b200cf593.jpg" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\VibedMediatr.Core\VibedMediatr.Core.csproj" />
+    </ItemGroup>
+    
+</Project>
