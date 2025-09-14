@@ -1,6 +1,6 @@
 # VibedMediatr
 
-A 'vibe coded' tiny, secure, and efficient drop-in replacement for MediatR's most common usage pattern.
+A tiny and efficient drop-in replacement for MediatR's most common usage pattern.
 
 [![NuGet](https://img.shields.io/nuget/v/VibedMediatr.svg)](https://www.nuget.org/packages/VibedMediatr/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
